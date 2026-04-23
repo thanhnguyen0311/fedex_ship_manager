@@ -9,12 +9,15 @@ Combined pipeline:
   5. Stamp Group SKU / Item SKU / PO Number onto the source label PDF and save to output_label/
   6. Group by master tracking number → merge into one PDF per group → send as single print job
 
-Requirements:  pip install pandas pypdf fpdf2 pywin32
+Requirements:  pip install pandas pypdf fpdf2 pywin32 pdfplumber
 
 Folder structure expected:
   main.py
-  tracking.csv        ← export report
-  dimension.csv       ← dimension reference
+  config.py
+  db.py
+  tracking.csv
+  dimension.csv
+  ca-certificate.crt
   output_label/       ← stamped output (created automatically)
 """
 
@@ -31,29 +34,8 @@ from pypdf import PdfReader, PdfWriter
 from fpdf import FPDF
 import pdfplumber
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-TRACKING_CSV     = "tracking.csv"
-DIMENSION_CSV    = "dimension.csv"
-SOURCE_LABEL_DIR = r"C:\ProgramData\FedEx\FSM\Temp"  # original FedEx label PDFs
-OUTPUT_LABEL_DIR = "output_label"                     # stamped output
-TOLERANCE        = 0.5    # dimension match tolerance (whole numbers after floor)
-FONT_SIZE        = 11     # text size for all stamped fields
-PRINT_DELAY      = 5    # seconds to wait between print jobs
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Item slot column indices (0-based) in dimension.csv
-ITEM_SLOTS = [
-    (2,  4,  5,  6),    # Item 1: name=C, L=E, W=F, H=G
-    (8,  10, 11, 12),   # Item 2: name=I, L=K, W=L, H=M
-    (14, 16, 17, 18),   # Item 3: name=O, L=Q, W=R, H=S
-    (20, 22, 23, 24),   # Item 4: name=U, L=W, W=X, H=Y
-]
-
-# ── Label stamp positions (points, pdfplumber top-down coords) ────────────────
-SKU_X_PT    = 101.7 + 6;  SKU_TOP_PT  = 262.7;  SKU_BOT_PT  = 275.7
-GSKU_X_PT   = 83.4  + 6;  GSKU_TOP_PT = 282.1;  GSKU_BOT_PT = 292.1
-PO_X_PT     = 22.0;       PO_TOP_PT   = 135.4;  PO_BOT_PT   = 142.4
-# ─────────────────────────────────────────────────────────────────────────────
+from config import *
+from service import save_orders
 
 
 # ── STEP 1: Scan output_label folder ─────────────────────────────────────────
@@ -71,32 +53,26 @@ def get_existing_labels(folder):
 # ── STEP 2: Read tracking report ─────────────────────────────────────────────
 
 def load_tracking_report(csv_path):
-    """
-    Column mapping (0-based index):
-      B  (1)  = Master Tracking Number
-      D  (3)  = Tracking Number
-      G  (6)  = Height
-      H  (7)  = Width
-      I  (8)  = Length
-      M  (12) = PO Number (forward-filled within master tracking group)
-      N  (13) = Group SKU (forward-filled globally)
-    """
     df = pd.read_csv(csv_path, header=0, dtype=str)
-    df.iloc[:, 13] = df.iloc[:, 13].replace("", pd.NA).ffill()
-    df.iloc[:, 12] = df.iloc[:, 12].replace("", pd.NA)
-    df.iloc[:, 12] = df.groupby(df.iloc[:, 1], sort=False)[df.columns[12]].ffill()
+    # Forward-fill group SKU globally
+    df.iloc[:, COL_GROUP_SKU] = df.iloc[:, COL_GROUP_SKU].replace("", pd.NA).ffill()
+    # Forward-fill PO number within each master tracking group only
+    df.iloc[:, COL_PO_NUMBER] = df.iloc[:, COL_PO_NUMBER].replace("", pd.NA)
+    df.iloc[:, COL_PO_NUMBER] = df.groupby(
+        df.iloc[:, COL_MASTER_TRACKING], sort=False
+    )[df.columns[COL_PO_NUMBER]].ffill()
 
     records = []
     for _, row in df.iterrows():
-        master_tracking = str(row.iloc[1]).strip()
-        tracking_num    = str(row.iloc[3]).strip()
-        group_sku       = str(row.iloc[13]).strip()
-        po_number       = str(row.iloc[12]).strip()
+        master_tracking = str(row.iloc[COL_MASTER_TRACKING]).strip()
+        tracking_num = str(row.iloc[COL_TRACKING_NUM]).strip()
+        group_sku = str(row.iloc[COL_GROUP_SKU]).strip()
+        po_number = str(row.iloc[COL_PO_NUMBER]).strip()
 
         try:
-            height = math.floor(float(row.iloc[6]))
-            width  = math.floor(float(row.iloc[7]))
-            length = math.floor(float(row.iloc[8]))
+            height = math.floor(float(row.iloc[COL_HEIGHT]))
+            width = math.floor(float(row.iloc[COL_WIDTH]))
+            length = math.floor(float(row.iloc[COL_LENGTH]))
         except (ValueError, TypeError):
             print(f"  SKIP (bad dimensions): {tracking_num}")
             continue
@@ -105,14 +81,25 @@ def load_tracking_report(csv_path):
             print(f"  SKIP (no group SKU): {tracking_num}")
             continue
 
+        def clean(val, r=row):
+            s = str(r.iloc[val]).strip()
+            return "" if s.lower() == "nan" else s
+
         records.append({
             "master_tracking": master_tracking,
-            "tracking_num":    tracking_num,
-            "group_sku":       group_sku,
-            "po_number":       po_number if po_number.lower() != "nan" else "",
-            "height":          height,
-            "width":           width,
-            "length":          length,
+            "tracking_num": tracking_num,
+            "group_sku": group_sku,
+            "po_number": po_number if po_number.lower() != "nan" else "",
+            "height": height,
+            "width": width,
+            "length": length,
+            "account_number": clean(COL_ACCOUNT_NUMBER),
+            "contact_name": clean(COL_CONTACT_NAME),
+            "state": clean(COL_STATE),
+            "zipcode": clean(COL_ZIPCODE),
+            "phone": clean(COL_PHONE),
+            "address_1": clean(COL_ADDRESS_1),
+            "address_2": clean(COL_ADDRESS_2),
         })
     return records
 
@@ -171,15 +158,12 @@ def find_item_sku(group_sku, height, width, length, lookup):
 # ── STEP 5: Stamp details onto label PDF ─────────────────────────────────────
 
 def has_existing_po(src_pdf):
-    """Return True if the label already has text in the PO: field area.
-    Checks for any words between x=21 (after 'PO:') and x=150 (before 'DEPT:')
-    on the PO row (top=133..144).
-    """
+    """Return True if the label already has text in the PO: field area."""
     with pdfplumber.open(src_pdf) as pdf:
         page = pdf.pages[0]
         words = page.extract_words()
         for w in words:
-            if 133 < w["top"] < 144 and w["x0"] > 21 and w["x1"] < 150:
+            if PO_TOP_PT - 2 < w["top"] < PO_BOT_PT + 2 and w["x0"] > 21 and w["x1"] < 150:
                 return True
         return False
 
@@ -220,7 +204,6 @@ def stamp_label(src_pdf, item_sku, group_sku, po_number, out_pdf):
 # ── STEP 6: Merge group PDFs and send single print job ───────────────────────
 
 def merge_pdfs(pdf_paths):
-    """Merge a list of PDF paths into one in-memory PDF bytes."""
     writer = PdfWriter()
     for path in pdf_paths:
         reader = PdfReader(path)
@@ -232,7 +215,6 @@ def merge_pdfs(pdf_paths):
 
 
 def print_pdf(pdf_path):
-    """Send a PDF file to the default printer."""
     if platform.system() == "Windows":
         import win32api
         win32api.ShellExecute(0, "print", pdf_path, None, ".", 0)
@@ -241,15 +223,13 @@ def print_pdf(pdf_path):
 
 
 def print_group(master_tracking, pdf_paths):
-    """Merge all labels for a master tracking group and send as one print job."""
     merged_bytes = merge_pdfs(pdf_paths)
-    # Write merged PDF to a temp file in output_label
-    merged_path = os.path.join(OUTPUT_LABEL_DIR, f"_print_{master_tracking}.pdf")
+    merged_path  = os.path.join(OUTPUT_LABEL_DIR, f"_print_{master_tracking}.pdf")
     with open(merged_path, "wb") as f:
         f.write(merged_bytes)
     print_pdf(merged_path)
     print(f"  >> Print job sent: master {master_tracking} "
-          f"({len(pdf_paths)} label(s)) → {os.path.basename(merged_path)}")
+          f"({len(pdf_paths)} label(s)) -> {os.path.basename(merged_path)}")
 
 
 # ── MAIN ─────────────────────────────────────────────────────────────────────
@@ -271,7 +251,7 @@ def main():
 
     # Step 2 — all tracking numbers from report
     print(f"[2] Reading '{TRACKING_CSV}' ...")
-    report_rows = load_tracking_report(TRACKING_CSV)
+    report_rows  = load_tracking_report(TRACKING_CSV)
     all_tracking = {r["tracking_num"] for r in report_rows}
     print(f"    {len(all_tracking)} tracking number(s) in report")
 
@@ -288,12 +268,11 @@ def main():
     lookup = load_dimension_csv(DIMENSION_CSV)
     print(f"    {len(lookup)} group SKU(s) loaded\n")
 
-    # Step 5 — stamp all missing labels, sorted by master tracking → tracking num
+    # Step 5 — stamp all missing labels, sorted by master tracking -> tracking num
     report_rows.sort(key=lambda r: (r["master_tracking"], r["tracking_num"]))
 
-    success = 0
-    failed  = 0
-    # Collect stamped PDF paths grouped by master tracking number (preserving order)
+    success   = 0
+    failed    = 0
     group_pdfs = defaultdict(list)
 
     print("[5] Stamping labels ...")
@@ -315,10 +294,11 @@ def main():
             failed += 1
             continue
 
-        out_pdf = os.path.join(OUTPUT_LABEL_DIR, f"{tnum}.pdf")
+        out_pdf     = os.path.join(OUTPUT_LABEL_DIR, f"{tnum}.pdf")
         po_to_stamp = row["po_number"] if not has_existing_po(src_pdf) else ""
         stamp_label(src_pdf, sku, row["group_sku"], po_to_stamp, out_pdf)
         group_pdfs[row["master_tracking"]].append(out_pdf)
+
         po_status = f"PO:{row['po_number']}" if po_to_stamp else "PO:already on label"
         print(f"  OK    {tnum}  ->  SKU:{sku}  GRP:{row['group_sku']}  {po_status}")
         success += 1
@@ -327,10 +307,14 @@ def main():
     print(f"\n[6] Sending {len(group_pdfs)} print job(s) ...")
     for master_tracking, pdf_paths in group_pdfs.items():
         print_group(master_tracking, pdf_paths)
-        time.sleep(PRINT_DELAY)   # small delay between jobs so spooler stays ordered
+        time.sleep(PRINT_DELAY)
 
     print(f"\nDone.  Stamped: {success}  |  Skipped/Failed: {failed}  |  Print jobs: {len(group_pdfs)}")
 
+    # Save orders to database for all successfully printed groups
+    if group_pdfs:
+        print("\n[7] Saving orders to database ...")
+        save_orders(group_pdfs, report_rows)
 
 if __name__ == "__main__":
     main()
