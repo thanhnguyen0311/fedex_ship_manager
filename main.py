@@ -145,14 +145,14 @@ def dims_match(r_h, r_w, r_l, d_h, d_w, d_l):
 
 def find_item_sku(group_sku, height, width, length, lookup):
     if group_sku not in lookup:
-        return None, f"group SKU '{group_sku}' not found in dimension.csv"
+        return group_sku, f"group SKU '{group_sku}' not found in dimension.csv — using group SKU as fallback"
     for item in lookup[group_sku]:
         if dims_match(height, width, length,
                       item["height"], item["width"], item["length"]):
             return item["item_name"], None
     available = [(i["item_name"], f"L={i['length']} W={i['width']} H={i['height']}")
                  for i in lookup[group_sku]]
-    return None, f"no dim match (report H={height} W={width} L={length} | options={available})"
+    return group_sku, f"no dim match (report H={height} W={width} L={length} | options={available}) — using group SKU as fallback"
 
 
 # ── STEP 5: Stamp details onto label PDF ─────────────────────────────────────
@@ -172,14 +172,14 @@ def make_overlay(item_sku, group_sku, po_number, page_w_pt, page_h_pt):
     PT2MM = 0.352778
     pdf = FPDF(unit="mm", format=(page_w_pt * PT2MM, page_h_pt * PT2MM))
     pdf.add_page()
-    pdf.set_font("Helvetica", style="B", size=FONT_SIZE)
     pdf.set_text_color(0, 0, 0)
 
-    def write_field(x_pt, top_pt, bot_pt, text):
+    def write_field(x_pt, top_pt, bot_pt, text, font_size=FONT_SIZE):
+        pdf.set_font("Helvetica", style="B", size=font_size)
         pdf.set_xy(x_pt * PT2MM, top_pt * PT2MM)
         pdf.cell(w=0, h=(bot_pt - top_pt) * PT2MM, text=text)
 
-    write_field(SKU_X_PT,  SKU_TOP_PT,  SKU_BOT_PT,  f"SKU: {item_sku}")
+    write_field(SKU_X_PT,  SKU_TOP_PT,  SKU_BOT_PT,  f"SKU: {item_sku}", font_size=FONT_SIZE + 2)
     if group_sku != item_sku:
         write_field(GSKU_X_PT, GSKU_TOP_PT, GSKU_BOT_PT, f"GRP: {group_sku}")
     if po_number:
@@ -289,10 +289,13 @@ def main():
 
         sku, err = find_item_sku(row["group_sku"], row["height"],
                                  row["width"], row["length"], lookup)
-        if sku is None:
-            print(f"  SKIP  {tnum}: {err}")
-            failed += 1
-            continue
+        if err:
+            print(f"  WARN  {tnum}: {err}")  # warn but continue
+
+        # if sku is None:
+        #     print(f"  SKIP  {tnum}: {err}")
+        #     failed += 1
+        #     continue
 
         out_pdf     = os.path.join(OUTPUT_LABEL_DIR, f"{tnum}.pdf")
         po_to_stamp = row["po_number"] if not has_existing_po(src_pdf) else ""
