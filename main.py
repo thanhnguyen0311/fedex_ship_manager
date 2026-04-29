@@ -54,24 +54,49 @@ def get_existing_labels(folder):
 
 def load_tracking_report(csv_path):
     df = pd.read_csv(csv_path, header=0, dtype=str)
-    # Forward-fill group SKU globally
-    df.iloc[:, COL_GROUP_SKU] = df.iloc[:, COL_GROUP_SKU].replace("", pd.NA).ffill()
-    # Forward-fill PO number within each master tracking group only
+
+    # ── Group SKU: fill in BOTH directions within (master + contact_name) ──
+    # The SKU can appear on any row in the group (not always the first),
+    # so ffill alone misses rows that come before the row that has it.
+    df.iloc[:, COL_GROUP_SKU] = df.iloc[:, COL_GROUP_SKU].replace("", pd.NA)
+    group_keys = [df.iloc[:, COL_MASTER_TRACKING], df.iloc[:, COL_CONTACT_NAME]]
+    df.iloc[:, COL_GROUP_SKU] = (
+        df.groupby(group_keys, sort=False)[df.columns[COL_GROUP_SKU]]
+          .transform(lambda s: s.ffill().bfill())   # ← bfill catches rows above the SKU row
+    )
+
+    # ── PO Number: same bidirectional fill, scoped per (master + contact_name) ──
     df.iloc[:, COL_PO_NUMBER] = df.iloc[:, COL_PO_NUMBER].replace("", pd.NA)
-    df.iloc[:, COL_PO_NUMBER] = df.groupby(
-        df.iloc[:, COL_MASTER_TRACKING], sort=False
-    )[df.columns[COL_PO_NUMBER]].ffill()
+    df.iloc[:, COL_PO_NUMBER] = (
+        df.groupby(group_keys, sort=False)[df.columns[COL_PO_NUMBER]]
+          .transform(lambda s: s.ffill().bfill())
+    )
+
+    # ── VALIDATION: warn on mixed-customer master tracking groups ──
+    mixed = (
+        df.groupby(df.iloc[:, COL_MASTER_TRACKING].rename("master"))
+          [df.columns[COL_CONTACT_NAME]]
+          .nunique()
+    )
+    for master, n in mixed.items():
+        if n > 1:
+            names = df.loc[
+                df.iloc[:, COL_MASTER_TRACKING] == master,
+                df.columns[COL_CONTACT_NAME]
+            ].unique().tolist()
+            print(f"  WARN  Master {master} spans {n} customers: {names} "
+                  f"— SKU/PO fill is scoped per customer")
 
     records = []
     for _, row in df.iterrows():
         master_tracking = str(row.iloc[COL_MASTER_TRACKING]).strip()
-        tracking_num = str(row.iloc[COL_TRACKING_NUM]).strip()
-        group_sku = str(row.iloc[COL_GROUP_SKU]).strip()
-        po_number = str(row.iloc[COL_PO_NUMBER]).strip()
+        tracking_num    = str(row.iloc[COL_TRACKING_NUM]).strip()
+        group_sku       = str(row.iloc[COL_GROUP_SKU]).strip()
+        po_number       = str(row.iloc[COL_PO_NUMBER]).strip()
 
         try:
             height = math.floor(float(row.iloc[COL_HEIGHT]))
-            width = math.floor(float(row.iloc[COL_WIDTH]))
+            width  = math.floor(float(row.iloc[COL_WIDTH]))
             length = math.floor(float(row.iloc[COL_LENGTH]))
         except (ValueError, TypeError):
             print(f"  SKIP (bad dimensions): {tracking_num}")
@@ -87,27 +112,32 @@ def load_tracking_report(csv_path):
 
         records.append({
             "master_tracking": master_tracking,
-            "tracking_num": tracking_num,
-            "group_sku": group_sku,
-            "po_number": po_number if po_number.lower() != "nan" else "",
-            "height": height,
-            "width": width,
-            "length": length,
-            "account_number": clean(COL_ACCOUNT_NUMBER),
-            "contact_name": clean(COL_CONTACT_NAME),
-            "state": clean(COL_STATE),
-            "zipcode": clean(COL_ZIPCODE),
-            "phone": clean(COL_PHONE),
-            "address_1": clean(COL_ADDRESS_1),
-            "address_2": clean(COL_ADDRESS_2),
+            "tracking_num":    tracking_num,
+            "group_sku":       group_sku,
+            "po_number":       po_number if po_number.lower() != "nan" else "",
+            "height":          height,
+            "width":           width,
+            "length":          length,
+            "account_number":  clean(COL_ACCOUNT_NUMBER),
+            "contact_name":    clean(COL_CONTACT_NAME),
+            "state":           clean(COL_STATE),
+            "zipcode":         clean(COL_ZIPCODE),
+            "phone":           clean(COL_PHONE),
+            "address_1":       clean(COL_ADDRESS_1),
+            "address_2":       clean(COL_ADDRESS_2),
         })
     return records
-
 
 # ── STEP 3: Load dimension lookup ────────────────────────────────────────────
 
 def load_dimension_csv(dim_path):
-    df = pd.read_csv(dim_path, header=0, dtype=str)
+    # Works for both local file paths and public URLs
+    if dim_path.startswith("http"):
+        df = pd.read_csv(dim_path, header=0, dtype=str)
+    else:
+        df = pd.read_csv(dim_path, header=0, dtype=str)
+    # rest of the function stays identical...
+
     lookup = {}
     for _, row in df.iterrows():
         group_sku = str(row.iloc[0]).strip()
@@ -124,6 +154,9 @@ def load_dimension_csv(dim_path):
                 continue
             if item_name and item_name.lower() != "nan":
                 try:
+
+                    # Sort so highest → length, middle → width, lowest → height
+                    length, width, height = sorted([length, width, height], reverse=True)
                     items.append({"item_name": item_name,
                                   "length": math.floor(length),
                                   "width":  math.floor(width),
@@ -133,6 +166,21 @@ def load_dimension_csv(dim_path):
         if items:
             lookup[group_sku] = items
     return lookup
+
+
+# ── STEP 2b: Load PO filter list from import.csv ─────────────────────────────
+
+def load_import_po_list(import_csv_path):
+    if not os.path.exists(import_csv_path):
+        return None
+    df = pd.read_csv(import_csv_path, header=0, dtype=str)
+    po_col = df.iloc[:, 3]
+    po_list = [v.strip() for v in po_col if isinstance(v, str) and v.strip()]
+    if not po_list:               # ← return None if column D is empty
+        return None
+    print(f"    {len(po_list)} PO number(s) loaded from '{import_csv_path}'")
+    return po_list
+
 
 
 # ── STEP 4: Match SKU by dimensions ──────────────────────────────────────────
@@ -236,7 +284,7 @@ def print_group(master_tracking, pdf_paths):
 
 def main():
     for path in (TRACKING_CSV, DIMENSION_CSV):
-        if not os.path.exists(path):
+        if not path.startswith("http") and not os.path.exists(path):
             print(f"ERROR: '{path}' not found.")
             sys.exit(1)
     if not os.path.exists(SOURCE_LABEL_DIR):
@@ -269,7 +317,17 @@ def main():
     print(f"    {len(lookup)} group SKU(s) loaded\n")
 
     # Step 5 — stamp all missing labels, sorted by master tracking -> tracking num
-    report_rows.sort(key=lambda r: (r["master_tracking"], r["tracking_num"]))
+    # Step 2b — load import PO filter (optional)
+    import_po_list = load_import_po_list(IMPORT_CSV)
+    if import_po_list is not None and len(import_po_list) > 0:  # ← add len check
+        po_order = {po: i for i, po in enumerate(import_po_list)}
+        import_po_set = set(import_po_list)
+        report_rows = [r for r in report_rows if r["po_number"] in import_po_set]
+        report_rows.sort(key=lambda r: (po_order.get(r["po_number"], 9999), r["tracking_num"]))
+        print(f"    {len(report_rows)} tracking row(s) match the import PO list\n")
+    else:
+        # No import.csv or empty → process all missing labels
+        report_rows.sort(key=lambda r: (r["master_tracking"], r["tracking_num"]))
 
     success   = 0
     failed    = 0
@@ -292,11 +350,6 @@ def main():
         if err:
             print(f"  WARN  {tnum}: {err}")  # warn but continue
 
-        # if sku is None:
-        #     print(f"  SKIP  {tnum}: {err}")
-        #     failed += 1
-        #     continue
-
         out_pdf     = os.path.join(OUTPUT_LABEL_DIR, f"{tnum}.pdf")
         po_to_stamp = row["po_number"] if not has_existing_po(src_pdf) else ""
         stamp_label(src_pdf, sku, row["group_sku"], po_to_stamp, out_pdf)
@@ -308,9 +361,12 @@ def main():
 
     # Step 6 — send one print job per master tracking group
     print(f"\n[6] Sending {len(group_pdfs)} print job(s) ...")
+
     for master_tracking, pdf_paths in group_pdfs.items():
         print_group(master_tracking, pdf_paths)
-        time.sleep(PRINT_DELAY)
+        delay = len(pdf_paths) * PRINT_DELAY
+        print(f"  >> Waiting {delay:.1f}s for {len(pdf_paths)} label(s) to print ...")
+        time.sleep(delay)
 
     print(f"\nDone.  Stamped: {success}  |  Skipped/Failed: {failed}  |  Print jobs: {len(group_pdfs)}")
 

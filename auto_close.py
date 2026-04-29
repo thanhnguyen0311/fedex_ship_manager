@@ -3,7 +3,7 @@ auto_close_pdf.py
 Runs non-stop in the background and automatically closes any PDF viewer windows
 as soon as they appear. Only targets PDFs with purely numeric filenames
 (e.g. 520242433272.pdf). Skips any PDF with letters in the filename
-(e.g. 20260422123342__BillOfLanding-3563704.pdf).
+(e.g. LABELS-18-18-15.pdf, BillOfLanding.pdf).
 """
 
 import subprocess
@@ -14,31 +14,31 @@ import re
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 CHECK_INTERVAL = 0.5   # seconds between scans (lower = faster kill)
 
-PDF_PROCESSES = [
-    "AcroRd32.exe",
-    "Acrobat.exe",
-    "FoxitPDFReader.exe",
-    "SumatraPDF.exe",
-]
-
 PDF_TITLE_KEYWORDS = [".pdf", "PDF", "Adobe", "Foxit", "Sumatra"]
 
-# Matches filenames that are ONLY digits followed by .pdf (case-insensitive)
-# e.g. 520242433272.pdf ✓   20260422123342__BillOfLanding.pdf ✗
-NUMERIC_PDF_PATTERN = re.compile(r'\b(\d+)\.pdf\b', re.IGNORECASE)
+# Extracts the PDF filename from a window title (anything ending in .pdf)
+PDF_FILENAME_PATTERN = re.compile(r'([^\\/\s]+\.pdf)', re.IGNORECASE)
+
+# The extracted filename must be ENTIRELY digits + .pdf — nothing else
+NUMERIC_ONLY_PDF_PATTERN = re.compile(r'^\d+\.pdf$', re.IGNORECASE)
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def is_numeric_pdf_title(title: str) -> bool:
+def is_numeric_only_pdf(title: str) -> bool:
     """
-    Return True only if the window title contains a purely numeric PDF filename.
-    Examples:
-      '520242433272.pdf - Adobe Acrobat'  → True
-      '20260422123342__BillOfLanding.pdf' → False  (has letters before .pdf)
-      'report_2024.pdf'                   → False  (has letters)
+    Extract the PDF filename from the window title, then check if it is
+    composed of digits ONLY (no letters, dashes, underscores, etc.).
+
+    ✓  '520242433272.pdf - Adobe Acrobat'   → True   (filename: 520242433272.pdf)
+    ✗  'LABELS-18-18-15.pdf - Chrome'       → False  (filename has letters/dashes)
+    ✗  '20260422__BillOfLanding.pdf'        → False  (filename has letters)
+    ✗  'report_2024.pdf'                    → False  (filename has underscore + letters)
     """
-    match = NUMERIC_PDF_PATTERN.search(title)
-    return match is not None
+    match = PDF_FILENAME_PATTERN.search(title)
+    if not match:
+        return False
+    filename = match.group(1)                      # e.g. "LABELS-18-18-15.pdf"
+    return bool(NUMERIC_ONLY_PDF_PATTERN.match(filename))  # full-string check
 
 
 def get_open_windows():
@@ -79,36 +79,23 @@ def close_window(hwnd):
         pass
 
 
-def kill_pdf_processes():
-    """Kill known standalone PDF viewer processes."""
-    killed = []
-    for proc in PDF_PROCESSES:
-        result = subprocess.run(
-            ["taskkill", "/F", "/IM", proc],
-            capture_output=True, text=True
-        )
-        if "SUCCESS" in result.stdout:
-            killed.append(proc)
-    return killed
-
-
 def close_pdf_windows():
     """
-    Close windows whose title contains a numeric-only PDF filename.
-    Skips any PDF with letters in the filename.
+    Close windows whose title contains a purely numeric PDF filename.
+    Any PDF filename containing letters, dashes, or underscores is skipped.
     """
     windows = get_open_windows()
     closed = []
     skipped = []
 
     for hwnd, title in windows:
-        # First check: does this window look like a PDF at all?
+        # Step 1: Does this window look like a PDF viewer at all?
         is_pdf_window = any(kw.lower() in title.lower() for kw in PDF_TITLE_KEYWORDS)
         if not is_pdf_window:
             continue
 
-        # Second check: is the PDF filename purely numeric?
-        if is_numeric_pdf_title(title):
+        # Step 2: Is the PDF filename purely numeric digits only?
+        if is_numeric_only_pdf(title):
             close_window(hwnd)
             closed.append(title)
         else:
@@ -122,26 +109,22 @@ def main():
     print("  Auto PDF Closer — running (Ctrl+C to stop)")
     print("=" * 60)
     print(f"  Scan interval : {CHECK_INTERVAL}s")
-    print(f"  Target pattern: numeric filenames only (e.g. 520242433272.pdf)")
-    print(f"  Skipping      : any PDF with letters in filename")
+    print(f"  CLOSE  : numeric filenames only  e.g. 520242466859.pdf")
+    print(f"  SKIP   : any letters/symbols     e.g. LABELS-18-18-15.pdf")
     print("-" * 60)
 
     total_closed = 0
 
     while True:
         try:
-            # 1. Kill standalone PDF viewer processes
-            # NOTE: Process-level kills are not filename-aware.
-            # Only enable if you are sure no letter-named PDFs will be open.
-            # killed_procs = kill_pdf_processes()
-
-            # 2. Close PDF windows/tabs — numeric filenames only
             closed_wins, skipped_wins = close_pdf_windows()
 
-            if closed_wins:
-                for w in closed_wins:
-                    total_closed += 1
-                    print(f"[CLOSED]   {w[:70]}  (total: {total_closed})")
+            for w in closed_wins:
+                total_closed += 1
+                print(f"[CLOSED]  {w[:70]}  (total: {total_closed})")
+
+            # for w in skipped_wins:
+            #     print(f"[SKIP]    {w[:70]}")
 
             time.sleep(CHECK_INTERVAL)
 
